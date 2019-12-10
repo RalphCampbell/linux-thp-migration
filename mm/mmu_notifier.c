@@ -129,6 +129,7 @@ static void mn_itree_inv_end(struct mmu_notifier_mm *mmn_mm)
 {
 	struct mmu_interval_notifier *mni;
 	struct hlist_node *next;
+	struct hlist_head removed_list;
 
 	spin_lock(&mmn_mm->lock);
 	if (--mmn_mm->active_invalidate_ranges ||
@@ -144,19 +145,34 @@ static void mn_itree_inv_end(struct mmu_notifier_mm *mmn_mm)
 	 * The inv_end incorporates a deferred mechanism like rtnl_unlock().
 	 * Adds and removes are queued until the final inv_end happens then
 	 * they are progressed. This arrangement for tree updates is used to
-	 * avoid using a blocking lock during invalidate_range_start.
+	 * avoid using a blocking lock while walking the interval tree.
 	 */
+	INIT_HLIST_HEAD(&removed_list);
 	hlist_for_each_entry_safe(mni, next, &mmn_mm->deferred_list,
 				  deferred_item) {
+		hlist_del(&mni->deferred_item);
 		if (RB_EMPTY_NODE(&mni->interval_tree.rb))
 			interval_tree_insert(&mni->interval_tree,
 					     &mmn_mm->itree);
-		else
+		else {
 			interval_tree_remove(&mni->interval_tree,
 					     &mmn_mm->itree);
-		hlist_del(&mni->deferred_item);
+			if (mni->ops->release)
+				hlist_add_head(&mni->deferred_item,
+					       &removed_list);
+		}
 	}
 	spin_unlock(&mmn_mm->lock);
+
+	hlist_for_each_entry_safe(mni, next, &removed_list, deferred_item) {
+		struct mm_struct *mm = mni->mm;
+
+		hlist_del(&mni->deferred_item);
+		mni->ops->release(mni);
+
+		/* pairs with mmgrab() in __mmu_interval_notifier_insert() */
+		mmdrop(mm);
+	}
 
 	wake_up_all(&mmn_mm->wq);
 }
@@ -252,6 +268,35 @@ unsigned long mmu_interval_read_begin(struct mmu_interval_notifier *mni)
 	return seq;
 }
 EXPORT_SYMBOL_GPL(mmu_interval_read_begin);
+
+/**
+ * mmu_interval_notifier_synchronize - wait for deferred operations to complete
+ * @mm: The mm of the process with interval notifiers
+ *
+ * Upon return, any deferred mmu interval notifier operations pending before
+ * this was called are complete.
+ */
+void mmu_interval_notifier_synchronize(struct mm_struct *mm)
+{
+	struct mmu_notifier_mm *mmn_mm = mm->mmu_notifier_mm;
+	unsigned long seq;
+	bool is_invalidating;
+
+	if (!mmn_mm)
+		return;
+
+	spin_lock(&mmn_mm->lock);
+	seq = mmn_mm->invalidate_seq;
+	is_invalidating = mn_itree_is_invalidating(mmn_mm);
+	spin_unlock(&mmn_mm->lock);
+
+	lock_map_acquire(&__mmu_notifier_invalidate_range_start_map);
+	lock_map_release(&__mmu_notifier_invalidate_range_start_map);
+	if (is_invalidating)
+		wait_event(mmn_mm->wq,
+			   READ_ONCE(mmn_mm->invalidate_seq) != seq);
+}
+EXPORT_SYMBOL_GPL(mmu_interval_notifier_synchronize);
 
 static void mn_itree_release(struct mmu_notifier_mm *mmn_mm,
 			     struct mm_struct *mm)
@@ -1006,23 +1051,12 @@ int mmu_interval_notifier_insert_safe(
 }
 EXPORT_SYMBOL_GPL(mmu_interval_notifier_insert_safe);
 
-/**
- * mmu_interval_notifier_remove - Remove a interval notifier
- * @mni: Interval notifier to unregister
- *
- * This function must be paired with mmu_interval_notifier_insert(). It cannot
- * be called from any ops callback.
- *
- * Once this returns ops callbacks are no longer running on other CPUs and
- * will not be called in future.
- */
-void mmu_interval_notifier_remove(struct mmu_interval_notifier *mni)
+static unsigned long __mmu_interval_notifier_remove_deferred(
+					struct mmu_interval_notifier *mni)
 {
 	struct mm_struct *mm = mni->mm;
 	struct mmu_notifier_mm *mmn_mm = mm->mmu_notifier_mm;
 	unsigned long seq = 0;
-
-	might_sleep();
 
 	spin_lock(&mmn_mm->lock);
 	if (mn_itree_is_invalidating(mmn_mm)) {
@@ -1043,6 +1077,28 @@ void mmu_interval_notifier_remove(struct mmu_interval_notifier *mni)
 	}
 	spin_unlock(&mmn_mm->lock);
 
+	return seq;
+}
+
+/**
+ * mmu_interval_notifier_remove - Remove an interval notifier
+ * @mni: Interval notifier to unregister
+ *
+ * This function must be paired with one of the mmu_interval_notifier_insert()
+ * functions. It cannot be called from any ops callback.
+ * Once this returns, ops callbacks are no longer running on other CPUs and
+ * will not be called in future.
+ */
+void mmu_interval_notifier_remove(struct mmu_interval_notifier *mni)
+{
+	struct mm_struct *mm = mni->mm;
+	struct mmu_notifier_mm *mmn_mm = mm->mmu_notifier_mm;
+	unsigned long seq;
+
+	might_sleep();
+
+	seq = __mmu_interval_notifier_remove_deferred(mni);
+
 	/*
 	 * The possible sleep on progress in the invalidation requires the
 	 * caller not hold any locks held by invalidation callbacks.
@@ -1053,10 +1109,33 @@ void mmu_interval_notifier_remove(struct mmu_interval_notifier *mni)
 		wait_event(mmn_mm->wq,
 			   READ_ONCE(mmn_mm->invalidate_seq) != seq);
 
-	/* pairs with mmgrab in mmu_interval_notifier_insert() */
-	mmdrop(mm);
+	/* pairs with mmgrab() in __mmu_interval_notifier_insert() */
+	if (!mni->ops->release)
+		mmdrop(mm);
 }
 EXPORT_SYMBOL_GPL(mmu_interval_notifier_remove);
+
+/**
+ * mmu_interval_notifier_remove_deferred - Unregister an interval notifier
+ * @mni: Interval notifier to unregister
+ *
+ * This function must be paired with one of the mmu_interval_notifier_insert()
+ * functions. It is safe to call from the invalidate() callback.
+ * Once this returns, ops callbacks may still be running on other CPUs and
+ * the release() callback will be called when they finish.
+ */
+void mmu_interval_notifier_remove_deferred(struct mmu_interval_notifier *mni)
+{
+	struct mm_struct *mm = mni->mm;
+
+	if (!__mmu_interval_notifier_remove_deferred(mni)) {
+		mni->ops->release(mni);
+
+		/* pairs with mmgrab() in __mmu_interval_notifier_insert() */
+		mmdrop(mm);
+	}
+}
+EXPORT_SYMBOL_GPL(mmu_interval_notifier_remove_deferred);
 
 /**
  * mmu_notifier_synchronize - Ensure all mmu_notifiers are freed

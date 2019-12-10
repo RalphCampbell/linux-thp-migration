@@ -233,11 +233,16 @@ struct mmu_notifier {
  * @invalidate: Upon return the caller must stop using any SPTEs within this
  *              range. This function can sleep. Return false only if sleeping
  *              was required but mmu_notifier_range_blockable(range) is false.
+ * @release:	This function should be defined when using
+ *		mmu_interval_notifier_remove_deferred(). It will be called when
+ *		the mmu_interval_notifier is removed from the interval tree.
+ *		No other callbacks will be generated after this returns.
  */
 struct mmu_interval_notifier_ops {
 	bool (*invalidate)(struct mmu_interval_notifier *mni,
 			   const struct mmu_notifier_range *range,
 			   unsigned long cur_seq);
+	void (*release)(struct mmu_interval_notifier *mni);
 };
 
 struct mmu_interval_notifier {
@@ -304,6 +309,8 @@ int mmu_interval_notifier_insert_safe(
 	unsigned long start, unsigned long length,
 	const struct mmu_interval_notifier_ops *ops);
 void mmu_interval_notifier_remove(struct mmu_interval_notifier *mni);
+void mmu_interval_notifier_remove_deferred(struct mmu_interval_notifier *mni);
+void mmu_interval_notifier_synchronize(struct mm_struct *mm);
 
 /**
  * mmu_interval_set_seq - Save the invalidation sequence
