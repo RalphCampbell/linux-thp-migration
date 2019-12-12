@@ -690,6 +690,7 @@ void prep_compound_page(struct page *page, unsigned int order)
 	}
 	atomic_set(compound_mapcount_ptr(page), -1);
 }
+EXPORT_SYMBOL_GPL(prep_compound_page);
 
 #ifdef CONFIG_DEBUG_PAGEALLOC
 unsigned int _debug_guardpage_minorder;

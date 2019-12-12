@@ -108,8 +108,13 @@ void memunmap_pages(struct dev_pagemap *pgmap)
 	int nid;
 
 	dev_pagemap_kill(pgmap);
-	for_each_device_pfn(pfn, pgmap)
-		put_page(pfn_to_page(pfn));
+	for_each_device_pfn(pfn, pgmap) {
+		struct page *page = pfn_to_page(pfn);
+		unsigned int order = compound_order(page);
+
+		put_page(page);
+		pfn += (1U << order) - 1;
+	}
 	dev_pagemap_cleanup(pgmap);
 
 	/* make sure to access a memmap that was actually initialized */

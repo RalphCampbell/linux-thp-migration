@@ -51,6 +51,7 @@
 #include <linux/oom.h>
 
 #include <asm/tlbflush.h>
+#include <asm/pgalloc.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/migrate.h>
@@ -244,11 +245,9 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
 		if (is_write_migration_entry(entry))
 			pte = maybe_mkwrite(pte, vma);
 
-		if (unlikely(is_zone_device_page(new))) {
-			if (is_device_private_page(new)) {
-				entry = make_device_private_entry(new, pte_write(pte));
-				pte = swp_entry_to_pte(entry);
-			}
+		if (unlikely(is_device_private_page(new))) {
+			entry = make_device_private_entry(new, pte_write(pte));
+			pte = swp_entry_to_pte(entry);
 		}
 
 #ifdef CONFIG_HUGETLB_PAGE
@@ -987,7 +986,7 @@ static int move_to_new_page(struct page *newpage, struct page *page,
 		}
 
 		/*
-		 * Anonymous and movable page->mapping will be cleard by
+		 * Anonymous and movable page->mapping will be cleared by
 		 * free_pages_prepare so don't reset it here for keeping
 		 * the type to work PageAnon, for example.
 		 */
@@ -1200,7 +1199,7 @@ out:
 		/*
 		 * A page that has been migrated has all references
 		 * removed and will be freed. A page that has not been
-		 * migrated will have kepts its references and be
+		 * migrated will have kept its references and be
 		 * restored.
 		 */
 		list_del(&page->lru);
@@ -2135,9 +2134,12 @@ static int migrate_vma_collect_hole(unsigned long start,
 {
 	struct migrate_vma *migrate = walk->private;
 	unsigned long addr;
+	const unsigned long pmd_mask = (HPAGE_PMD_NR << PAGE_SHIFT) - 1;
 
 	for (addr = start; addr < end; addr += PAGE_SIZE) {
 		migrate->src[migrate->npages] = MIGRATE_PFN_MIGRATE;
+		if ((addr & pmd_mask) == 0 && (end & pmd_mask) == 0)
+			migrate->src[migrate->npages] |= MIGRATE_PFN_HUGE;
 		migrate->dst[migrate->npages] = 0;
 		migrate->npages++;
 		migrate->cpages++;
@@ -2172,48 +2174,87 @@ static int migrate_vma_collect_pmd(pmd_t *pmdp,
 	unsigned long addr = start, unmapped = 0;
 	spinlock_t *ptl;
 	pte_t *ptep;
+	pmd_t pmd;
 
 again:
-	if (pmd_none(*pmdp))
+	pmd = READ_ONCE(*pmdp);
+	if (pmd_none(pmd))
 		return migrate_vma_collect_hole(start, end, walk);
 
-	if (pmd_trans_huge(*pmdp)) {
+	if (pmd_trans_huge(pmd) || !pmd_present(pmd)) {
 		struct page *page;
+		unsigned long write = 0;
+		int ret;
 
 		ptl = pmd_lock(mm, pmdp);
-		if (unlikely(!pmd_trans_huge(*pmdp))) {
+		if (pmd_trans_huge(*pmdp)) {
+			page = pmd_page(*pmdp);
+			if (is_huge_zero_page(page)) {
+				spin_unlock(ptl);
+				return migrate_vma_collect_hole(start, end,
+								walk);
+			}
+			if (pmd_write(*pmdp))
+				write = MIGRATE_PFN_WRITE;
+		} else if (!pmd_present(*pmdp)) {
+			swp_entry_t entry = pmd_to_swp_entry(*pmdp);
+
+			if (!is_device_private_entry(entry)) {
+				spin_unlock(ptl);
+				return migrate_vma_collect_skip(start, end,
+								walk);
+			}
+			page = device_private_entry_to_page(entry);
+			if (is_write_device_private_entry(entry))
+				write = MIGRATE_PFN_WRITE;
+		} else {
 			spin_unlock(ptl);
 			goto again;
 		}
 
-		page = pmd_page(*pmdp);
-		if (is_huge_zero_page(page)) {
+		get_page(page);
+		if (unlikely(!trylock_page(page))) {
 			spin_unlock(ptl);
-			split_huge_pmd(vma, pmdp, addr);
-			if (pmd_trans_unstable(pmdp))
-				return migrate_vma_collect_skip(start, end,
-								walk);
-		} else {
-			int ret;
-
-			get_page(page);
-			spin_unlock(ptl);
-			if (unlikely(!trylock_page(page)))
-				return migrate_vma_collect_skip(start, end,
-								walk);
-			ret = split_huge_page(page);
-			unlock_page(page);
 			put_page(page);
-			if (ret)
-				return migrate_vma_collect_skip(start, end,
-								walk);
-			if (pmd_none(*pmdp))
-				return migrate_vma_collect_hole(start, end,
-								walk);
+			return migrate_vma_collect_skip(start, end, walk);
 		}
+#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
+		if ((start & HPAGE_PMD_MASK) == start &&
+		    start + HPAGE_PMD_SIZE == end) {
+			struct page_vma_mapped_walk vmw = {
+				.vma = vma,
+				.address = start,
+				.pmd = pmdp,
+				.ptl = ptl,
+			};
+
+			migrate->src[migrate->npages] = write |
+				migrate_pfn(page_to_pfn(page)) |
+				MIGRATE_PFN_MIGRATE | MIGRATE_PFN_LOCKED |
+				MIGRATE_PFN_HUGE;
+			migrate->dst[migrate->npages] = 0;
+			migrate->npages++;
+			migrate->cpages++;
+			migrate_vma_collect_skip(start + PAGE_SIZE, end, walk);
+
+			/* Note that this also removes the page from the rmap. */
+			set_pmd_migration_entry(&vmw, page);
+			spin_unlock(ptl);
+
+			return 0;
+		}
+#endif
+		spin_unlock(ptl);
+		ret = split_huge_page(page);
+		unlock_page(page);
+		put_page(page);
+		if (ret)
+			return migrate_vma_collect_skip(start, end, walk);
+		if (pmd_none(*pmdp))
+			return migrate_vma_collect_hole(start, end, walk);
 	}
 
-	if (unlikely(pmd_bad(*pmdp)))
+	if (unlikely(pmd_bad(pmd) || pmd_devmap(pmd)))
 		return migrate_vma_collect_skip(start, end, walk);
 
 	ptep = pte_offset_map_lock(mm, pmdp, addr, &ptl);
@@ -2262,8 +2303,7 @@ again:
 			mpfn |= pte_write(pte) ? MIGRATE_PFN_WRITE : 0;
 		}
 
-		/* FIXME support THP */
-		if (!page || !page->mapping || PageTransCompound(page)) {
+		if (!page || !page->mapping) {
 			mpfn = 0;
 			goto next;
 		}
@@ -2370,14 +2410,6 @@ static bool migrate_vma_check_page(struct page *page)
 	 */
 	int extra = 1;
 
-	/*
-	 * FIXME support THP (transparent huge page), it is bit more complex to
-	 * check them than regular pages, because they can be mapped with a pmd
-	 * or with a pte (split pte mapping).
-	 */
-	if (PageCompound(page))
-		return false;
-
 	/* Page from ZONE_DEVICE have one extra reference */
 	if (is_zone_device_page(page)) {
 		/*
@@ -2471,6 +2503,10 @@ static void migrate_vma_prepare(struct migrate_vma *migrate)
 				}
 				continue;
 			}
+			if (PageTransHuge(page))
+				mod_node_page_state(page_pgdat(page),
+					NR_ISOLATED_ANON + page_is_file_cache(page),
+					hpage_nr_pages(page));
 
 			/* Drop the reference we took in collect */
 			put_page(page);
@@ -2485,15 +2521,23 @@ static void migrate_vma_prepare(struct migrate_vma *migrate)
 				if (!is_zone_device_page(page)) {
 					get_page(page);
 					putback_lru_page(page);
+					if (PageTransHuge(page))
+						mod_node_page_state(page_pgdat(page),
+							 NR_ISOLATED_ANON + page_is_file_cache(page),
+							 -HPAGE_PMD_NR);
 				}
 			} else {
 				migrate->src[i] = 0;
 				unlock_page(page);
 				migrate->cpages--;
 
-				if (!is_zone_device_page(page))
+				if (!is_zone_device_page(page)) {
+					if (PageTransHuge(page))
+						mod_node_page_state(page_pgdat(page),
+							 NR_ISOLATED_ANON + page_is_file_cache(page),
+							 -HPAGE_PMD_NR);
 					putback_lru_page(page);
-				else
+				} else
 					put_page(page);
 			}
 		}
@@ -2676,13 +2720,114 @@ int migrate_vma_setup(struct migrate_vma *args)
 }
 EXPORT_SYMBOL(migrate_vma_setup);
 
+#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
+/*
+ * This code closely follows:
+ * do_huge_pmd_anonymous_page()
+ *   __do_huge_pmd_anonymous_page()
+ * except that the page being inserted is likely to be a device private page
+ * instead of an allocated or zero page.
+ */
+static int insert_huge_pmd_anonymous_page(struct vm_area_struct *vma,
+					  unsigned long addr,
+					  struct page *page,
+					  unsigned long *src,
+					  unsigned long *dst,
+					  pmd_t *pmdp)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned int i;
+	spinlock_t *ptl;
+	struct mem_cgroup *memcg;
+	bool flush = false;
+	pgtable_t pgtable;
+	gfp_t gfp;
+	pmd_t entry;
+
+	if (unlikely(anon_vma_prepare(vma)))
+		goto abort;
+
+	prep_transhuge_page(page);
+
+	gfp = GFP_TRANSHUGE_LIGHT;
+	if (mem_cgroup_try_charge(page, mm, gfp, &memcg, true))
+		goto abort;
+
+	pgtable = pte_alloc_one(mm);
+	if (unlikely(!pgtable))
+		goto uncharge_abort;
+
+	__SetPageUptodate(page);
+
+	if (is_zone_device_page(page)) {
+		if (!is_device_private_page(page))
+			goto pgtable_abort;
+		entry = swp_entry_to_pmd(make_device_private_entry(page,
+						vma->vm_flags & VM_WRITE));
+	} else {
+		entry = mk_huge_pmd(page, vma->vm_page_prot);
+		entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+	}
+
+	ptl = pmd_lock(mm, pmdp);
+
+	if (check_stable_address_space(mm))
+		goto unlock_abort;
+
+	/*
+	 * Check for userfaultfd but do not deliver the fault. Instead,
+	 * just back off.
+	 */
+	if (userfaultfd_missing(vma))
+		goto unlock_abort;
+
+	if (pmd_present(*pmdp)) {
+		if (!is_huge_zero_pmd(*pmdp))
+			goto unlock_abort;
+		flush = true;
+	} else if (!pmd_none(*pmdp))
+		goto unlock_abort;
+
+	get_page(page);
+	page_add_new_anon_rmap(page, vma, addr, true);
+	mem_cgroup_commit_charge(page, memcg, false, true);
+	if (!is_device_private_page(page))
+		lru_cache_add_active_or_unevictable(page, vma);
+	if (flush) {
+		pte_free(mm, pgtable);
+		flush_cache_range(vma, addr, addr + HPAGE_PMD_SIZE);
+		pmdp_invalidate(vma, addr, pmdp);
+	} else {
+		pgtable_trans_huge_deposit(mm, pmdp, pgtable);
+		mm_inc_nr_ptes(mm);
+	}
+	set_pmd_at(mm, addr, pmdp, entry);
+	update_mmu_cache_pmd(vma, addr, pmdp);
+	add_mm_counter(mm, MM_ANONPAGES, HPAGE_PMD_NR);
+	spin_unlock(ptl);
+
+	return 0;
+
+unlock_abort:
+	spin_unlock(ptl);
+pgtable_abort:
+	pte_free(mm, pgtable);
+uncharge_abort:
+	mem_cgroup_cancel_charge(page, memcg, true);
+abort:
+	for (i = 0; i < HPAGE_PMD_NR; i++)
+		src[i] &= ~MIGRATE_PFN_MIGRATE;
+	return -EINVAL;
+}
+#endif
+
 /*
  * This code closely matches the code in:
  *   __handle_mm_fault()
  *     handle_pte_fault()
  *       do_anonymous_page()
- * to map in an anonymous zero page but the struct page will be a ZONE_DEVICE
- * private page.
+ * to map in an anonymous zero page except the struct page is already allocated
+ * and will likely be a ZONE_DEVICE private page.
  */
 static void migrate_vma_insert_page(struct migrate_vma *migrate,
 				    unsigned long addr,
@@ -2717,7 +2862,16 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
 	if (!pmdp)
 		goto abort;
 
-	if (pmd_trans_huge(*pmdp) || pmd_devmap(*pmdp))
+#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
+	if (*dst & MIGRATE_PFN_HUGE) {
+		int ret = insert_huge_pmd_anonymous_page(vma, addr, page, src,
+							 dst, pmdp);
+		if (ret)
+			goto abort;
+		return;
+	}
+#endif
+	if (pmd_trans_huge(*pmdp) || pmd_devmap(*pmdp) || pmd_bad(*pmdp))
 		goto abort;
 
 	/*
@@ -2755,7 +2909,8 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
 
 			swp_entry = make_device_private_entry(page, vma->vm_flags & VM_WRITE);
 			entry = swp_entry_to_pte(swp_entry);
-		}
+		} else
+			goto cancel_abort;
 	} else {
 		entry = mk_pte(page, vma->vm_page_prot);
 		if (vma->vm_flags & VM_WRITE)
@@ -2784,11 +2939,11 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
 		goto unlock_abort;
 
 	inc_mm_counter(mm, MM_ANONPAGES);
+	get_page(page);
 	page_add_new_anon_rmap(page, vma, addr, false);
 	mem_cgroup_commit_charge(page, memcg, false, false);
 	if (!is_zone_device_page(page))
 		lru_cache_add_active_or_unevictable(page, vma);
-	get_page(page);
 
 	if (flush) {
 		flush_cache_page(vma, addr, pte_pfn(*ptep));
@@ -2802,11 +2957,11 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
 	}
 
 	pte_unmap_unlock(ptep, ptl);
-	*src = MIGRATE_PFN_MIGRATE;
 	return;
 
 unlock_abort:
 	pte_unmap_unlock(ptep, ptl);
+cancel_abort:
 	mem_cgroup_cancel_charge(page, memcg, false);
 abort:
 	*src &= ~MIGRATE_PFN_MIGRATE;
@@ -2828,7 +2983,7 @@ void migrate_vma_pages(struct migrate_vma *migrate)
 	unsigned long addr, i;
 	bool notified = false;
 
-	for (i = 0, addr = start; i < npages; addr += PAGE_SIZE, i++) {
+	for (i = 0, addr = start; i < npages; ) {
 		struct page *newpage = migrate_pfn_to_page(migrate->dst[i]);
 		struct page *page = migrate_pfn_to_page(migrate->src[i]);
 		struct address_space *mapping;
@@ -2836,12 +2991,12 @@ void migrate_vma_pages(struct migrate_vma *migrate)
 
 		if (!newpage) {
 			migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
-			continue;
+			goto next;
 		}
 
 		if (!page) {
 			if (!(migrate->src[i] & MIGRATE_PFN_MIGRATE))
-				continue;
+				goto next;
 			if (!notified) {
 				notified = true;
 
@@ -2855,7 +3010,7 @@ void migrate_vma_pages(struct migrate_vma *migrate)
 			migrate_vma_insert_page(migrate, addr, newpage,
 						&migrate->src[i],
 						&migrate->dst[i]);
-			continue;
+			goto next;
 		}
 
 		mapping = page_mapping(page);
@@ -2876,13 +3031,22 @@ void migrate_vma_pages(struct migrate_vma *migrate)
 				 * supported.
 				 */
 				migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
-				continue;
+				goto next;
 			}
 		}
 
 		r = migrate_page(mapping, newpage, page, MIGRATE_SYNC_NO_COPY);
 		if (r != MIGRATEPAGE_SUCCESS)
 			migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
+
+	next:
+		if (newpage) {
+			addr += hpage_nr_pages(newpage) << PAGE_SHIFT;
+			i += hpage_nr_pages(newpage);
+		} else {
+			addr += PAGE_SIZE;
+			i++;
+		}
 	}
 
 	/*
@@ -2911,7 +3075,7 @@ void migrate_vma_finalize(struct migrate_vma *migrate)
 	const unsigned long npages = migrate->npages;
 	unsigned long i;
 
-	for (i = 0; i < npages; i++) {
+	for (i = 0; i < npages; ) {
 		struct page *newpage = migrate_pfn_to_page(migrate->dst[i]);
 		struct page *page = migrate_pfn_to_page(migrate->src[i]);
 
@@ -2920,7 +3084,7 @@ void migrate_vma_finalize(struct migrate_vma *migrate)
 				unlock_page(newpage);
 				put_page(newpage);
 			}
-			continue;
+			goto next;
 		}
 
 		if (!(migrate->src[i] & MIGRATE_PFN_MIGRATE) || !newpage) {
@@ -2947,6 +3111,11 @@ void migrate_vma_finalize(struct migrate_vma *migrate)
 			else
 				putback_lru_page(newpage);
 		}
+	next:
+		if (migrate->dst[i] & MIGRATE_PFN_HUGE)
+			i += HPAGE_PMD_NR;
+		else
+			i++;
 	}
 }
 EXPORT_SYMBOL(migrate_vma_finalize);

@@ -804,6 +804,7 @@ static inline unsigned int page_shift(struct page *page)
 }
 
 void free_compound_page(struct page *page);
+void prep_compound_page(struct page *page, unsigned int order);
 
 #ifdef CONFIG_MMU
 /*
