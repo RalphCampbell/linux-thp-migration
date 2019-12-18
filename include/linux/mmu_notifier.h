@@ -251,6 +251,8 @@ struct mmu_interval_notifier {
 	struct mm_struct *mm;
 	struct hlist_node deferred_item;
 	unsigned long invalidate_seq;
+	unsigned long updated_start;
+	unsigned long updated_last;
 };
 
 #ifdef CONFIG_MMU_NOTIFIER
@@ -311,6 +313,8 @@ int mmu_interval_notifier_insert_safe(
 void mmu_interval_notifier_remove(struct mmu_interval_notifier *mni);
 void mmu_interval_notifier_remove_deferred(struct mmu_interval_notifier *mni);
 void mmu_interval_notifier_synchronize(struct mm_struct *mm);
+void mmu_interval_notifier_update(struct mmu_interval_notifier *mni,
+				  unsigned long start, unsigned long last);
 
 /**
  * mmu_interval_set_seq - Save the invalidation sequence

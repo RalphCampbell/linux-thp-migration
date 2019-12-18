@@ -157,7 +157,14 @@ static void mn_itree_inv_end(struct mmu_notifier_mm *mmn_mm)
 		else {
 			interval_tree_remove(&mni->interval_tree,
 					     &mmn_mm->itree);
-			if (mni->ops->release)
+			if (mni->updated_last) {
+				mni->interval_tree.start = mni->updated_start;
+				mni->interval_tree.last = mni->updated_last;
+				mni->updated_start = 0;
+				mni->updated_last = 0;
+				interval_tree_insert(&mni->interval_tree,
+						     &mmn_mm->itree);
+			} else if (mni->ops->release)
 				hlist_add_head(&mni->deferred_item,
 					       &removed_list);
 		}
@@ -901,6 +908,8 @@ static int __mmu_interval_notifier_insert(
 	mni->ops = ops;
 	RB_CLEAR_NODE(&mni->interval_tree.rb);
 	mni->interval_tree.start = start;
+	mni->updated_start = 0;
+	mni->updated_last = 0;
 	/*
 	 * Note that the representation of the intervals in the interval tree
 	 * considers the ending point as contained in the interval.
@@ -1067,8 +1076,12 @@ static unsigned long __mmu_interval_notifier_remove_deferred(
 		if (RB_EMPTY_NODE(&mni->interval_tree.rb)) {
 			hlist_del(&mni->deferred_item);
 		} else {
-			hlist_add_head(&mni->deferred_item,
-				       &mmn_mm->deferred_list);
+			if (mni->updated_last) {
+				mni->updated_start = 0;
+				mni->updated_last = 0;
+			} else
+				hlist_add_head(&mni->deferred_item,
+					       &mmn_mm->deferred_list);
 			seq = mmn_mm->invalidate_seq;
 		}
 	} else {
@@ -1136,6 +1149,56 @@ void mmu_interval_notifier_remove_deferred(struct mmu_interval_notifier *mni)
 	}
 }
 EXPORT_SYMBOL_GPL(mmu_interval_notifier_remove_deferred);
+
+/**
+ * mmu_interval_notifier_update - Update interval notifier range
+ * @mni: Interval notifier to update
+ * @start: New starting virtual address to monitor
+ * @last: New last virtual address (inclusive) to monitor
+ *
+ * This function updates the range being monitored and is safe to call from
+ * the invalidate() callback function.
+ * Upon return, the mmu_interval_notifier range may not be updated in the
+ * interval tree yet. The caller must use the normal interval notifier read
+ * flow via mmu_interval_read_begin() to establish SPTEs for this range.
+ */
+void mmu_interval_notifier_update(struct mmu_interval_notifier *mni,
+				  unsigned long start, unsigned long last)
+{
+	struct mm_struct *mm = mni->mm;
+	struct mmu_notifier_mm *mmn_mm = mm->mmu_notifier_mm;
+	unsigned long seq = 0;
+
+	if (WARN_ON(start >= last))
+		return;
+
+	spin_lock(&mmn_mm->lock);
+	if (mn_itree_is_invalidating(mmn_mm)) {
+		/*
+		 * Update is being called after insert put this on the
+		 * deferred list, but before the deferred list was processed.
+		 */
+		if (RB_EMPTY_NODE(&mni->interval_tree.rb)) {
+			mni->interval_tree.start = start;
+			mni->interval_tree.last = last;
+		} else {
+			if (!mni->updated_last)
+				hlist_add_head(&mni->deferred_item,
+					       &mmn_mm->deferred_list);
+			mni->updated_start = start;
+			mni->updated_last = last;
+		}
+		seq = mmn_mm->invalidate_seq;
+	} else {
+		WARN_ON(RB_EMPTY_NODE(&mni->interval_tree.rb));
+		interval_tree_remove(&mni->interval_tree, &mmn_mm->itree);
+		mni->interval_tree.start = start;
+		mni->interval_tree.last = last;
+		interval_tree_insert(&mni->interval_tree, &mmn_mm->itree);
+	}
+	spin_unlock(&mmn_mm->lock);
+}
+EXPORT_SYMBOL_GPL(mmu_interval_notifier_update);
 
 /**
  * mmu_notifier_synchronize - Ensure all mmu_notifiers are freed
