@@ -1200,6 +1200,39 @@ void mmu_interval_notifier_update(struct mmu_interval_notifier *mni,
 }
 EXPORT_SYMBOL_GPL(mmu_interval_notifier_update);
 
+struct mmu_interval_notifier *mmu_interval_notifier_find(struct mm_struct *mm,
+				const struct mmu_interval_notifier_ops *ops,
+				unsigned long start, unsigned long last)
+{
+	struct mmu_notifier_mm *mmn_mm = mm->mmu_notifier_mm;
+	struct interval_tree_node *node;
+	struct mmu_interval_notifier *mni;
+	struct mmu_interval_notifier *res = NULL;
+
+	spin_lock(&mmn_mm->lock);
+	node = interval_tree_iter_first(&mmn_mm->itree, start, last);
+	if (node) {
+		mni = container_of(node, struct mmu_interval_notifier,
+				   interval_tree);
+		while (true) {
+			if (mni->ops == ops) {
+				res = mni;
+				break;
+			}
+			node = interval_tree_iter_next(&mni->interval_tree,
+						       start, last);
+			if (!node)
+				break;
+			mni = container_of(node, struct mmu_interval_notifier,
+					   interval_tree);
+		}
+	}
+	spin_unlock(&mmn_mm->lock);
+
+	return res;
+}
+EXPORT_SYMBOL_GPL(mmu_interval_notifier_find);
+
 /**
  * mmu_notifier_synchronize - Ensure all mmu_notifiers are freed
  *

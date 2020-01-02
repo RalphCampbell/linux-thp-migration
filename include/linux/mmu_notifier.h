@@ -315,6 +315,21 @@ void mmu_interval_notifier_remove_deferred(struct mmu_interval_notifier *mni);
 void mmu_interval_notifier_synchronize(struct mm_struct *mm);
 void mmu_interval_notifier_update(struct mmu_interval_notifier *mni,
 				  unsigned long start, unsigned long last);
+struct mmu_interval_notifier *mmu_interval_notifier_find(struct mm_struct *mm,
+				const struct mmu_interval_notifier_ops *ops,
+				unsigned long start, unsigned long last);
+
+static inline unsigned long mmu_interval_notifier_start(
+				struct mmu_interval_notifier *mni)
+{
+	return mni->interval_tree.start;
+}
+
+static inline unsigned long mmu_interval_notifier_last(
+				struct mmu_interval_notifier *mni)
+{
+	return mni->interval_tree.last;
+}
 
 /**
  * mmu_interval_set_seq - Save the invalidation sequence
