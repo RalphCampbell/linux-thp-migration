@@ -913,16 +913,17 @@ static int __mmu_interval_notifier_insert(
 /**
  * mmu_interval_notifier_insert - Insert an interval notifier
  * @mni: Interval notifier to register
+ * @mm: mm_struct to attach to
  * @start: Starting virtual address to monitor
  * @length: Length of the range to monitor
- * @mm : mm_struct to attach to
+ * @ops: Interval notifier callback operations
  *
  * This function subscribes the interval notifier for notifications from the
- * mm.  Upon return the ops related to mmu_interval_notifier will be called
+ * mm.  Upon return, the ops related to mmu_interval_notifier will be called
  * whenever an event that intersects with the given range occurs.
  *
- * Upon return the range_notifier may not be present in the interval tree yet.
- * The caller must use the normal interval notifier read flow via
+ * Upon return, the mmu_interval_notifier may not be present in the interval
+ * tree yet.  The caller must use the normal interval notifier read flow via
  * mmu_interval_read_begin() to establish SPTEs for this range.
  */
 int mmu_interval_notifier_insert(struct mmu_interval_notifier *mni,
@@ -968,6 +969,42 @@ int mmu_interval_notifier_insert_locked(
 					      ops);
 }
 EXPORT_SYMBOL_GPL(mmu_interval_notifier_insert_locked);
+
+/**
+ * mmu_interval_notifier_insert_safe - Insert an interval notifier
+ * @mni: Interval notifier to register
+ * @mm: mm_struct to attach to
+ * @start: Starting virtual address to monitor
+ * @length: Length of the range to monitor
+ * @ops: Interval notifier callback operations
+ *
+ * Return: -EINVAL if @mm hasn't been initialized for interval notifiers
+ *	by calling mmu_notifier_register(NULL, mm) or
+ *	__mmu_notifier_register(NULL, mm).
+ *
+ * This function subscribes the interval notifier for notifications from the
+ * mm.  Upon return, the ops related to mmu_interval_notifier will be called
+ * whenever an event that intersects with the given range occurs.
+ *
+ * This function is safe to call from the ops->invalidate() function.
+ * Upon return, the mmu_interval_notifier may not be present in the interval
+ * tree yet.  The caller must use the normal interval notifier read flow via
+ * mmu_interval_read_begin() to establish SPTEs for this range.
+ */
+int mmu_interval_notifier_insert_safe(
+	struct mmu_interval_notifier *mni, struct mm_struct *mm,
+	unsigned long start, unsigned long length,
+	const struct mmu_interval_notifier_ops *ops)
+{
+	struct mmu_notifier_mm *mmn_mm;
+
+	mmn_mm = mm->mmu_notifier_mm;
+	if (!mmn_mm || !mmn_mm->has_itree)
+		return -EINVAL;
+	return __mmu_interval_notifier_insert(mni, mm, mmn_mm, start, length,
+					      ops);
+}
+EXPORT_SYMBOL_GPL(mmu_interval_notifier_insert_safe);
 
 /**
  * mmu_interval_notifier_remove - Remove a interval notifier
