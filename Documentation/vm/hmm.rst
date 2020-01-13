@@ -149,12 +149,12 @@ CPU page table into a device page table; HMM helps keep both synchronized. A
 device driver that wants to mirror a process address space must start with the
 registration of a mmu_interval_notifier::
 
- mni->ops = &driver_ops;
  int mmu_interval_notifier_insert(struct mmu_interval_notifier *mni,
-			          unsigned long start, unsigned long length,
-			          struct mm_struct *mm);
+			          struct mm_struct *mm, unsigned long start,
+				  unsigned long length,
+				  const struct mmu_interval_notifier_ops *ops);
 
-During the driver_ops->invalidate() callback the device driver must perform
+During the driver_ops->invalidate() callback, the device driver must perform
 the update action to the range (mark range read only, or fully unmap,
 etc.). The device must complete the update before the driver callback returns.
 
@@ -174,7 +174,7 @@ entry in that array corresponds to an address in the virtual range. HMM
 provides a set of flags to help the driver identify special CPU page table
 entries.
 
-Locking within the sync_cpu_device_pagetables() callback is the most important
+Locking within the invalidate() callback is the most important
 aspect the driver must respect in order to keep things properly synchronized.
 The usage pattern is::
 
@@ -207,7 +207,7 @@ The usage pattern is::
       up_read(&mm->mmap_sem);
 
       take_lock(driver->update);
-      if (mmu_interval_read_retry(&ni, range.notifier_seq) {
+      if (mmu_interval_read_retry(range.notifier, range.notifier_seq) {
           release_lock(driver->update);
           goto again;
       }
